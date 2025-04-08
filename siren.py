@@ -1,14 +1,14 @@
-# 전체 SIREN 실행 및 평가 코드 (STRAINER 제거)
+# 전체 SIREN 실행 및 평가 코드 (MNIST-M 테스트 + 복원 이미지 저장)
 
 import os
 import torch
 import torch.nn as nn
 import numpy as np
 import random
-import imageio.v2 as imageio
 import glob
 from tqdm import tqdm
-from torchvision.transforms import Resize, ToTensor, CenterCrop, Normalize, Compose
+from torchvision.transforms import Resize, ToTensor, Normalize, Compose
+import torchvision.utils as vutils
 from collections import defaultdict
 
 # --------------------------
@@ -50,9 +50,9 @@ class SIREN(nn.Module):
         self.net = nn.Sequential(*self.net)
 
     def forward(self, coords):
-        B, N, _ = coords.shape  # coords: [B, N, 2]
-        out = self.net(coords.view(-1, 2))  # [B*N, out_channels]
-        return out.view(B, N, -1)  # [B, N, 3]
+        B, N, _ = coords.shape
+        out = self.net(coords.view(-1, 2))
+        return out.view(B, N, -1)
 
 
 # --------------------------
@@ -63,6 +63,10 @@ def fit_siren(coords, data, model, optim, config, name):
     gt_tensor = data['gt']
     psnr_vals = []
     tbar = tqdm(range(config['epochs']))
+    save_dir = os.path.join('logs_SIREN', 'reconstructed_images', name)
+    os.makedirs(save_dir, exist_ok=True)
+    final_recon_img = None
+
     for epoch in tbar:
         output = model(coords)
         loss = ((output - gt_tensor) ** 2).mean()
@@ -77,25 +81,32 @@ def fit_siren(coords, data, model, optim, config, name):
         psnr_vals.append(psnr.item())
 
         tbar.set_description(f"{name} | Epoch {epoch}/{config['epochs']} | Loss: {loss.item():.6f} | PSNR: {psnr:.4f}")
-    return {"psnr": psnr_vals, "state_dict": model.state_dict()}
+
+        if epoch == config['epochs'] - 1:
+            recon = output_img[0].reshape(config['image_size'][0], config['image_size'][1], 3)
+            recon = recon.permute(2, 0, 1).clamp(0.0, 1.0)
+            final_recon_img = recon.detach().cpu()
+            save_path = os.path.join(save_dir, f"final_recon.png")
+            vutils.save_image(final_recon_img, save_path)
+
+    return {"psnr": psnr_vals, "state_dict": model.state_dict(), "reconstructed_img": final_recon_img}
 
 
 # --------------------------
 # 데이터 로딩
 # --------------------------
 
-def get_test_data(path, idx=0, sidelen=256, zero_mean=True, device='cuda'):
-    files = sorted(glob.glob(os.path.join(path, "*.jpg")))
-    img = np.array(imageio.imread(files[idx]), dtype=np.float32) / 255.
-    if img.ndim == 2:
-        img = np.expand_dims(img, axis=-1)
-    transform = Compose([
-        ToTensor(),
-        CenterCrop(min(img.shape[:2])),
-        Resize((sidelen, sidelen))
-    ])
+def get_test_data_from_mnistm(tensor_data, idx=0, sidelen=256, zero_mean=True, device='cuda'):
+    img = tensor_data[idx]
+    img = img.float() / 255.0
+    if img.ndim == 3 and img.shape[0] == 3:
+        pass
+    elif img.ndim == 3 and img.shape[2] == 3:
+        img = img.permute(2, 0, 1)
+    aug_list = [Resize((sidelen, sidelen))]
     if zero_mean:
-        transform.transforms.append(Normalize([0.5], [0.5]))
+        aug_list.append(Normalize([0.5]*3, [0.5]*3))
+    transform = Compose(aug_list)
     img = transform(img).permute(1, 2, 0)
     return torch.stack([img]).float().to(device)
 
@@ -104,7 +115,7 @@ def get_coords(H, W, device='cuda'):
     x = torch.linspace(-1, 1, W).to(device)
     y = torch.linspace(-1, 1, H).to(device)
     X, Y = torch.meshgrid(x, y, indexing='xy')
-    coords = torch.stack((X, Y), dim=-1).reshape(-1, 2)  # [H*W, 2]
+    coords = torch.stack((X, Y), dim=-1).reshape(-1, 2)
     return coords
 
 
@@ -125,15 +136,18 @@ if __name__ == '__main__':
     config['hidden_features'] = 256
     config['in_channels'] = 2
     config['out_channels'] = 3
+    config['image_size'] = IMG_SIZE
 
-    TESTING_PATH = "/local_datasets/celeba_hq/val/female"
-    coords = get_coords(*IMG_SIZE, device=device).unsqueeze(0)  # [1, H*W, 2]
+    coords = get_coords(*IMG_SIZE, device=device).unsqueeze(0)
 
-    test_files = sorted(glob.glob(os.path.join(TESTING_PATH, "*.jpg")))[:100]
+    TESTING_PATH = "/local_datasets/MNIST-M/processed/mnist_m_test.pt"
+    mnistm_dataset = torch.load(TESTING_PATH)
+    mnistm_data = mnistm_dataset[0]
+
     ret_siren_test_all = {}
 
-    for idx in range(len(test_files)):
-        im_tensor = get_test_data(TESTING_PATH, idx=idx, device=device)[0].reshape(1, -1, 3)
+    for idx in range(100):
+        im_tensor = get_test_data_from_mnistm(mnistm_data, idx=idx, sidelen=IMG_SIZE[0], device=device)[0].reshape(1, -1, 3)
         model = SIREN(
             in_features=config['in_channels'],
             hidden_features=config['hidden_features'],
@@ -146,5 +160,5 @@ if __name__ == '__main__':
         ret_siren_test_all[str(idx+1).zfill(2)] = ret
 
     os.makedirs("logs_SIREN", exist_ok=True)
-    torch.save(ret_siren_test_all, f"logs_SIREN/female_siren_test_seed{seed}.pt")
+    torch.save(ret_siren_test_all, f"logs_SIREN/mnistm_siren_test_seed{seed}.pt")
     print("SIREN 테스트 완료 및 결과 저장")
